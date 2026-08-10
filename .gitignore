@@ -2,3 +2,10 @@ __pycache__/
 *.pyc
 .env
 *_env
+
+# 자격증명 / 로컬 산출물 (평소엔 ~/.cache/wsb_briefing/ 에 있지만 실수 방지)
+cookies.json
+telegram.json
+wsb_daily_report_archive.md
+wsb_candidates.json
+wsb_report.md

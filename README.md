@@ -10,18 +10,44 @@
 
 2. Python 패키지 설치:
    ```bash
-   pip install praw requests
+   pip install requests
    ```
 
-3. 환경변수 설정 (`~/.wsb_env` 같은 별도 파일로 분리 권장):
+3. 텔레그램 봇 설정 — 둘 중 편한 쪽으로:
+
+   **(A) `--set-token`으로 저장 (chat id 자동 탐지)**
    ```bash
-   export REDDIT_CLIENT_ID="..."
-   export REDDIT_CLIENT_SECRET="..."
-   export REDDIT_USERNAME="..."         # User-Agent에 포함됨. Reddit API 정책상
-                                         # 실제 계정명이 없으면 rate-limit/차단 위험이 있음
+   # 먼저 텔레그램에서 봇에게 아무 메시지나 한 번 보내세요.
+   # 봇은 먼저 말을 걸 수 없어서, 이 메시지가 있어야 chat id가 생깁니다.
+   python3 scripts/notify.py --set-token <BOT_TOKEN>
+   ```
+   토큰을 검증한 뒤 chat id를 자동으로 찾아 `~/.cache/wsb_briefing/telegram.json`
+   (권한 0600)에 저장해요. 리포지토리에는 저장하지 않습니다.
+   chat id를 직접 알고 있으면 `--set-token <BOT_TOKEN> <CHAT_ID>`로 넘겨도 돼요.
+
+   **(B) 환경변수** (`~/.wsb_env` 같은 별도 파일로 분리 권장) — 이쪽이 우선합니다:
+   ```bash
    export TELEGRAM_BOT_TOKEN="..."      # @BotFather 로 발급
-   export TELEGRAM_CHAT_ID="..."        # 봇과 대화 후 getUpdates로 확인
+   export TELEGRAM_CHAT_ID="..."
    export NOTIFY_CHANNEL="telegram"     # telegram / slack / file
+   ```
+
+4. Reddit 인증 — Reddit이 비인증 `.json` 접근을 403으로 막아서 둘 중 하나가 필요해요.
+   요청 코드는 한 벌이고, 아래 환경변수 유무로 어느 쪽을 쓸지가 자동으로 갈립니다.
+
+   **(A) 공식 API** — 승인받았다면 이쪽이 안정적이에요. `praw` 패키지는 필요 없고
+   스크립트가 토큰을 직접 발급해요 (client_credentials, 읽기 전용):
+   ```bash
+   export REDDIT_CLIENT_ID="..."        # https://www.reddit.com/prefs/apps → script 타입
+   export REDDIT_CLIENT_SECRET="..."
+   export REDDIT_USERNAME="..."         # User-Agent 표기용. Reddit 정책상 넣어두는 게 안전
+   ```
+
+   **(B) 브라우저 쿠키** — API 승인 전 임시 방편:
+   ```bash
+   # F12 → Application → Cookies → https://www.reddit.com 에서 값 복사
+   export REDDIT_COOKIES='{"loid":"...","session_tracker":"...","csv":"..."}'
+   # 또는 같은 JSON을 ~/.cache/wsb_briefing/cookies.json 에 저장
    ```
 
 ## 스킬 테스트 (수동 실행)
@@ -75,9 +101,13 @@ crontab -e
   실제로 리포트에 실린 8개만 `fetch_and_score.py --mark-sent <id...>`로
   명시적으로 기록해요. 그래야 상위 8개에 못 든 후보가 다음 날 다시 나올 수
   있고, 전송이 실패한 날은 그 게시물들이 "보냄" 처리되지 않아요.
-- `fetch.lock`: 실행 중임을 표시하는 lock 파일. cron이 겹쳐 돌아도
-  두 번째 실행은 즉시 종료돼요 (30분 넘게 남아있으면 죽은 프로세스로 보고
-  자동 정리). 정상 종료 시 자동으로 지워지므로 평소엔 안 보여요.
+- `cookies.json`: Reddit 쿠키 (API 키를 안 쓸 때 필수). 브라우저에서 로그인된
+  상태의 `loid`, `session_tracker`, `csv`, `edgebucket` 등을 담아두면 돼요.
+- `telegram.json`: `--set-token`으로 저장한 봇 토큰 + chat id (권한 0600).
+  환경변수가 설정돼 있으면 그쪽이 우선합니다.
+- `fetch.lock`: `flock`으로 잡는 중복 실행 방지용 락 파일. cron이 겹쳐
+  돌아도 두 번째 실행은 즉시 종료돼요. 프로세스가 죽으면 커널이 락을 자동
+  해제하므로 남은 파일을 손으로 지울 일은 없어요.
 
 문제가 생기면 이 디렉토리를 지우고 다시 실행해도 안전해요. 다음 실행 때
 자동으로 재생성됩니다.
@@ -98,8 +128,9 @@ crontab -e
   대한 상위 허용이고, 실제로 어떤 파일을 건드릴 수 있는지는 스킬의
   `allowed-tools`가 더 좁게 제한해요.
 - 채널을 텔레그램에서 다른 걸로 바꾸려면 `NOTIFY_CHANNEL` 환경변수만
-  바꾸면 돼요. 새 채널(이메일, 디스코드 등) 추가는
-  `scripts/notify.py`에 클래스 하나 추가 + `get_notifier()` 분기 추가로 끝나요.
-- 파이프라인이 실패하면(Reddit API 장애, 티커 목록 다운로드 실패 등)
+  바꾸면 돼요. 새 채널(이메일, 디스코드 등) 추가는 `scripts/notify.py`의
+  `send()`에 `elif` 한 줄 추가로 끝나요.
+- 파이프라인이 실패하면(Reddit 403, 티커 목록 다운로드 실패 등)
   `fetch_and_score.py`가 자체적으로 실패 알림을 전송하고 종료 코드 1을
   반환해요. cron 로그(`~/wsb_cron_error.log`)에서 원인을 확인하세요.
+- `fcntl`을 쓰기 때문에 리눅스/macOS 전용이에요 (출력 경로도 `/tmp` 고정).
