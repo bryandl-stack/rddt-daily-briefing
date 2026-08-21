@@ -91,6 +91,12 @@ WEIGHTS = {"hot_rank": 0.50, "freshness": 0.25, "ticker_trend": 0.25}
 #   K=20 기준: 1위 1.00 / 5위 0.82 / 10위 0.64 / 20위 0.39 / 50위 0.09
 HOT_RANK_DECAY = 20.0
 
+# 한 티커가 브리핑을 도배하는 걸 막는다(실측: 상위 20 중 MRNA가 6개였음).
+# 후보 단계에서 막아두면 스킬이 그중 8개를 어떻게 고르든 한도를 못 넘는다.
+# 티커가 여러 개인 글은 특정 종목 글이 아니라 여러 종목을 다루는 글이므로 제외 대상이 아니고,
+# 티커가 없는 글도 셀 대상이 없어 제한하지 않는다.
+MAX_POSTS_PER_TICKER = 3
+
 # apewisdom 상위 몇 개까지를 "트렌딩"으로 볼지, 순위가 이만큼 뛰면 모멘텀 가점
 APEWISDOM_TOP_N = 25
 MOMENTUM_RANK_JUMP = 5
@@ -485,7 +491,26 @@ def score_and_collect(posts, valid_tickers, trend_scores):
         scored.append((final_score, p, post_tickers[i]))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[:TOP_N_CANDIDATES], ticker_counter
+
+    # 점수순으로 훑으며 티커별 한도를 넘는 글만 건너뛰고 다음 후보로 채운다
+    selected, per_ticker, skipped = [], Counter(), 0
+    for entry in scored:
+        tickers = set(entry[2])
+        solo = next(iter(tickers)) if len(tickers) == 1 else None
+        if solo is not None:
+            if per_ticker[solo] >= MAX_POSTS_PER_TICKER:
+                skipped += 1
+                continue
+            per_ticker[solo] += 1
+        selected.append(entry)
+        if len(selected) >= TOP_N_CANDIDATES:
+            break
+
+    if skipped:
+        log.info(f"티커당 {MAX_POSTS_PER_TICKER}개 한도로 {skipped}개 건너뜀")
+    if len(selected) < TOP_N_CANDIDATES:
+        log.warning(f"한도 적용 후 후보가 {len(selected)}개뿐이에요 (목표 {TOP_N_CANDIDATES}개)")
+    return selected, ticker_counter
 
 
 def build_output(scored, ticker_counter, trending):
