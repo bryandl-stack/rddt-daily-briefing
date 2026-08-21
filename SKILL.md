@@ -10,7 +10,7 @@ allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/fetch_and_score.py *) Ba
 ## 1단계: 후보 게시물 수집 + 점수 계산
 
 다음 명령을 실행해 오늘의 후보 게시물을 가져와.
-투표수/참여속도/플레어/티커트렌드 4가지 기준으로 이미 점수가 계산되고,
+hot 순위/신선도/티커트렌드 3가지 기준으로 이미 점수가 계산되고,
 최근 3일 내 이미 내보낸 게시물은 자동으로 제외된 상태로
 `/tmp/wsb_candidates.json`에 점수 내림차순으로 저장돼:
 
@@ -25,15 +25,20 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/fetch_and_score.py
 ## 2단계: JSON 읽기
 
 Read 도구로 `/tmp/wsb_candidates.json`을 읽어. 각 게시물 항목에는
-id, title, body, url, permalink, created_kst, num_comments, score,
-upvote_ratio, flair, tickers, top_comments, final_score가 들어 있어.
+id, title, body, url, permalink, author, created_kst, hot_rank,
+tickers, final_score가 들어 있어. 최상위에는 trending_tickers
+(티커별 언급수 목록)와 trending_source도 있어.
+
+`hot_rank`는 Reddit hot 피드에서의 순위(1이 최상위)라 투표수/댓글수 대신
+쓰는 인기 지표야. 투표수·댓글수·플레어는 이 수집 경로에서 제공되지 않아.
 **id는 5단계에서 필요하니 상위 8개를 고를 때 따로 기억해둬.**
 
 ## 3단계: 상위 8개 게시물 요약 (네가 직접 작성)
 
 점수 상위 8개를 골라 각각에 대해 한국어로 2~3문장 요약을 작성해.
 - 투자 조언처럼 들리지 않게, "무슨 일이 있었는지 / 무슨 주장인지"만 담백하게 요약
-- body가 비어 있으면(이미지/링크 게시물) top_comments 위주로 요약
+- body가 비어 있으면(이미지/링크 게시물) 제목과 url에서 읽히는 것만 담백하게
+  쓰고, 추측으로 내용을 지어내지 마. 짧아도 괜찮아
 - 과장하거나 확정적 어조로 쓰지 말 것 (예: "폭등할 것" 대신 "폭등 가능성을 주장함")
 
 ## 4단계: 리포트 조립
@@ -46,7 +51,7 @@ upvote_ratio, flair, tickers, top_comments, final_score가 들어 있어.
 🔥 오늘 언급 많은 티커: {티커1}({횟수}), {티커2}({횟수}), ...
 
 1. {제목}
-↑{score} · 💬{num_comments} · {flair 또는 '무플레어'}
+🔥 hot #{hot_rank} · {created_kst}
 {네가 쓴 2~3문장 요약}
 {permalink}
 
@@ -54,7 +59,8 @@ upvote_ratio, flair, tickers, top_comments, final_score가 들어 있어.
 ...
 ```
 
-전체 후보군의 tickers 필드를 집계해서 "오늘 언급 많은 티커" 상위 5개를 직접 계산해.
+"오늘 언급 많은 티커"는 JSON 최상위의 `trending_tickers`를 그대로 써
+(서브레딧 전체 집계라 후보 20개만 세는 것보다 정확해). 상위 5개까지만 넣어.
 
 ## 5단계: 전송
 

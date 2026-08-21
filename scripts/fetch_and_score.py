@@ -1,48 +1,56 @@
 """
-r/wallstreetbets 후보 게시물 수집 + 4가지 기준 점수 계산
+r/wallstreetbets 후보 게시물 수집 + 점수 계산
 → /tmp/wsb_candidates.json 에 점수 내림차순으로 저장
 
-개선 사항:
-  - 티커 인식: 블랙리스트 대신 실제 NASDAQ/NYSE/AMEX 전체 티커 목록과 대조
-    (주 1회 캐시 갱신, 다운로드 실패 시 캐시 또는 내장 폴백 리스트 사용)
+수집 경로: Reddit 공식 Atom 피드 + apewisdom 티커 집계 (둘 다 인증 불필요).
+  Reddit API(OAuth)는 데이터센터 IP에서 개발자 토큰 없이는 403이라 못 씀.
+  RSS는 같은 IP에서 토큰 없이 열리지만 rate limit이 빡빡해서(토큰 버킷,
+  60초를 띄워도 429가 남) 요청을 하루 1회 1건으로 줄이고 재시도를 길게 둠.
+
+RSS로 얻는 것: id, 제목, 본문, 작성자, 작성시각, permalink, hot 순위
+RSS에 없는 것: score, num_comments, upvote_ratio, 플레어
+  → hot 피드의 "순서" 자체가 Reddit의 랭킹(투표수+참여속도 반영)이라
+    engagement/velocity 대용으로 씀. 최근에 올라왔는데 이미 상위 =
+    빠르게 뜨는 글이므로 hot 순위 × 신선도로 velocity가 사실상 복원됨.
+
+점수 기준(가중치):
+  - hot_rank    0.50  피드에서의 위치 (Reddit 자체 랭킹)
+  - freshness   0.25  published 기준 신선도
+  - ticker_trend 0.25 apewisdom 언급수 + 24시간 순위 변동(모멘텀)
+                      apewisdom 실패 시 로컬 티커 카운트로 폴백
+
+기존 유지 사항:
+  - 티커 인식: 실제 NASDAQ/NYSE/AMEX 전체 티커 목록과 대조 (주 1회 캐시)
   - 네트워크 호출에 재시도(exponential backoff) 적용
   - 최근 N일간 이미 내보낸 게시물 ID는 후보에서 제외 (중복 방지)
-  - logging 모듈로 구조화된 로그 출력
+  - "내보냄" 표시는 리포트에 실제로 들어간 글만 `--mark-sent`로 별도 표시
+  - 티커 오탐 감소: 흔한 영단어와 겹치는 티커는 `$` 접두사가 있을 때만 인정
+  - cron 중복 실행 방지용 lock 파일
   - 파이프라인 실패 시 notify.py를 통해 실패 알림 전송
-  - "내보냄" 표시는 더 이상 이 스크립트가 자동으로 하지 않음. 실제로
-    리포트에 포함된 게시물만 `--mark-sent`로 스킬(SKILL.md 5단계)이
-    명시적으로 표시함 (표시 안 된 후보는 다음 실행 때 다시 나올 수 있음)
-  - 댓글 수집(get_top_comments) 실패가 개별 게시물에 그치도록 격리 —
-    한 게시물의 댓글 조회가 실패해도 전체 파이프라인이 죽지 않음
-  - 티커 오탐 감소: 흔한 영단어와 겹치는 실제 티커(ON, SO, IT, ALL 등)는
-    `$` 접두사가 있을 때만 인정
-  - cron 중복 실행 방지용 lock 파일 추가
-  - 중복 제외 필터링 후 후보가 너무 적으면 더 넓은 풀로 재시도
 
 사전 준비:
-  pip install praw requests
-  export REDDIT_CLIENT_ID="..."
-  export REDDIT_CLIENT_SECRET="..."
-  export REDDIT_USERNAME="..."   # User-Agent에 포함됨 (Reddit API 정책 준수용)
+  pip install requests          # praw 불필요
+  (Reddit 자격증명 불필요. 텔레그램 관련 환경변수는 notify.py 참고)
 
 사용법:
-  python3 fetch_and_score.py                  # 후보 수집 + 점수 계산
+  python3 fetch_and_score.py                    # 후보 수집 + 점수 계산
   python3 fetch_and_score.py --mark-sent ID...  # 지정한 게시물 id를 "전송 완료"로 표시
 """
 
 import os
 import re
 import sys
+import html
 import json
+import math
 import time
 import logging
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 
 import requests
-import praw
-from prawcore.exceptions import PrawcoreException
 
 # ── 로깅 설정 ────────────────────────────────────────────
 logging.basicConfig(
@@ -52,21 +60,19 @@ logging.basicConfig(
 )
 log = logging.getLogger("wsb_fetch")
 
-# ── 자격증명 / 설정 ──────────────────────────────────────
-REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID", "")
-REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "")
-REDDIT_USERNAME = os.environ.get("REDDIT_USERNAME", "")
-REDDIT_USER_AGENT = (
-    f"wsb_daily_briefing_skill by u/{REDDIT_USERNAME}"
-    if REDDIT_USERNAME
-    else "wsb_daily_briefing_skill (REDDIT_USERNAME 미설정)"
-)
-
+# ── 설정 ─────────────────────────────────────────────────
 SUBREDDIT_NAME = "wallstreetbets"
 FETCH_POOL_SIZE = 100
 TOP_N_CANDIDATES = 20
-TOP_COMMENTS_PER_POST = 5
 OUTPUT_PATH = "/tmp/wsb_candidates.json"
+
+RSS_URL = f"https://www.reddit.com/r/{SUBREDDIT_NAME}/hot/.rss?limit={FETCH_POOL_SIZE}"
+APEWISDOM_URL = "https://apewisdom.io/api/v1.0/filter/wallstreetbets/page/1"
+# 데이터센터 IP에서 기본 UA로 가면 봇 탐지에 더 잘 걸림
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 CACHE_DIR = Path.home() / ".cache" / "wsb_briefing"
 TICKER_CACHE_PATH = CACHE_DIR / "tickers_cache.json"
@@ -77,8 +83,27 @@ TICKER_CACHE_MAX_AGE_DAYS = 7
 SENT_ID_RETENTION_DAYS = 3   # 이 기간 내 표시된 글은 다시 후보에 안 올림
 LOCK_STALE_SECONDS = 30 * 60  # 이보다 오래된 lock은 죽은 프로세스로 간주하고 정리
 
-WEIGHTS = {"engagement": 0.35, "velocity": 0.30, "flair": 0.15, "ticker_trend": 0.20}
-PRIORITY_FLAIRS = {"DD", "News", "Discussion", "Macro"}
+WEIGHTS = {"hot_rank": 0.50, "freshness": 0.25, "ticker_trend": 0.25}
+
+# hot 순위 → 점수 감쇠 상수. Reddit의 hot 점수는 순위에 따라 지수적으로
+# 떨어지는데 순위를 선형 정규화하면 상위권이 뭉개져서(4위와 16위 차이가
+# 0.07밖에 안 됨) 변별력이 없다. exp(-(rank-1)/K)로 상위권을 벌린다.
+#   K=20 기준: 1위 1.00 / 5위 0.82 / 10위 0.64 / 20위 0.39 / 50위 0.09
+HOT_RANK_DECAY = 20.0
+
+# apewisdom 상위 몇 개까지를 "트렌딩"으로 볼지, 순위가 이만큼 뛰면 모멘텀 가점
+APEWISDOM_TOP_N = 25
+MOMENTUM_RANK_JUMP = 5
+MOMENTUM_BONUS = 0.2
+
+# 매일 고정으로 올라오는 스티키 메가스레드. RSS엔 stickied 플래그가 없어서
+# 제목 패턴으로 거른다 (안 거르면 항상 hot 최상단을 차지해 후보를 잡아먹음)
+MEGATHREAD_PATTERN = re.compile(
+    r"^\s*(daily discussion thread|weekly earnings thread|what are your moves"
+    r"|most anticipated earnings|daily thread|weekend discussion"
+    r"|moves tomorrow)",
+    re.IGNORECASE,
+)
 
 # 다운로드 실패 + 캐시도 없을 때만 쓰는 최소 폴백 (대형주/WSB 단골 위주)
 FALLBACK_TICKERS = {
@@ -92,15 +117,29 @@ FALLBACK_TICKERS = {
 TICKER_DOLLAR_PATTERN = re.compile(r"\$([A-Z]{1,5})\b")
 TICKER_BARE_PATTERN = re.compile(r"\b([A-Z]{1,5})\b")
 
-# 흔한 영단어와 우연히 겹치는 실제 티커들. $ 접두사 없이 등장하면 본문이
-# 그냥 그 단어를 쓴 것일 확률이 높아서, 이 목록은 $ 없이는 티커로 인정하지 않음
+# 흔한 영단어/약어와 우연히 겹치는 실제 티커들. $ 접두사 없이 등장하면
+# 본문이 그냥 그 단어를 쓴 것일 확률이 높아서, $ 없이는 티커로 인정하지 않음
 AMBIGUOUS_WORD_TICKERS = {
+    # 일반 영단어
     "A", "I", "IT", "SO", "ON", "GO", "ALL", "ARE", "CAT", "KEY", "NOW",
     "FOR", "ONE", "CAN", "NEW", "DAY", "LOW", "OPEN", "REAL", "WELL",
     "GOOD", "PLAY", "FAST", "TRUE", "NEXT", "FREE", "SAFE", "EASY",
     "MOVE", "GAIN", "LOSS", "HOLD", "SELL", "BUY", "CALL", "PUT", "RUN",
+    "YOU", "HERE",
+    # 금융/WSB 약어 — 실제 티커지만 본문에선 약어로 쓰이는 쪽이 압도적
+    #   FCF=free cash flow, COO=최고운영책임자, IMO=in my opinion 등
+    #   (LNG는 Cheniere Energy 티커로 정상 언급이 많아 일부러 뺐음)
+    "FCF", "IMO", "COO", "CEO", "CFO", "EPS", "ATH", "IPO", "ROI",
+    "GDP", "CPI", "FED", "ETF", "SEC", "IRS", "USA", "YOLO", "TLDR",
+    "EOD", "OTM", "ITM",
 }
 
+# 1~2글자 토큰은 오탐이 압도적이라("S&P 500"이 S와 P로 쪼개지는 등)
+# $ 접두사를 요구한다. 단 apewisdom 상위권(= trend_scores 키)에 있으면
+# 실제로 활발히 거론되는 티커이므로 예외로 인정한다 (예: MU 145회).
+SHORT_TICKER_MAX_LEN = 2
+
+ATOM_NS = {"a": "http://www.w3.org/2005/Atom"}
 KST = timezone(timedelta(hours=9))
 
 
@@ -173,12 +212,19 @@ def _download_ticker_list() -> set:
     return tickers
 
 
-def extract_tickers(text: str, valid_tickers: set):
+def extract_tickers(text: str, valid_tickers: set, short_whitelist=None):
+    """본문에서 티커를 뽑는다.
+
+    short_whitelist: $ 없이도 인정할 1~2글자 티커 집합 (apewisdom 상위권).
+      None이면 1~2글자는 $ 접두사가 있을 때만 인정한다.
+    """
     text = text or ""
+    short_ok = short_whitelist or set()
     dollar_hits = set(TICKER_DOLLAR_PATTERN.findall(text))
     bare_hits = {
         t for t in TICKER_BARE_PATTERN.findall(text)
         if t not in AMBIGUOUS_WORD_TICKERS
+        and (len(t) > SHORT_TICKER_MAX_LEN or t in short_ok)
     }
     candidates = dollar_hits | bare_hits
     return [t for t in candidates if t in valid_tickers]
@@ -244,37 +290,149 @@ def save_sent_ids(new_ids: list):
     SENT_IDS_PATH.write_text(json.dumps(existing), encoding="utf-8")
 
 
-# ── Reddit 수집 ──────────────────────────────────────────
-def get_reddit():
-    if not REDDIT_CLIENT_ID or not REDDIT_CLIENT_SECRET:
-        raise RuntimeError("REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET 환경변수가 설정되지 않았어요")
-    return praw.Reddit(
-        client_id=REDDIT_CLIENT_ID,
-        client_secret=REDDIT_CLIENT_SECRET,
-        user_agent=REDDIT_USER_AGENT,
+# ── RSS 파싱 헬퍼 ────────────────────────────────────────
+def _strip_html(fragment: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", fragment)
+    return " ".join(html.unescape(text).split())
+
+
+def _parse_body(content_html: str) -> str:
+    """셀프포스트 본문만 뽑는다. 링크/이미지 게시물이면 빈 문자열.
+
+    Reddit Atom의 content는 <table>로 감싼 미리보기 + 작성자/링크 푸터인데,
+    셀프포스트일 때만 그 안에 <!-- SC_OFF --><div class="md">본문</div>
+    <!-- SC_ON --> 이 끼어 있다.
+    """
+    m = re.search(r"<!--\s*SC_OFF\s*-->(.*?)<!--\s*SC_ON\s*-->", content_html, re.S)
+    return _strip_html(m.group(1)) if m else ""
+
+
+def _parse_external_url(content_html: str, permalink: str):
+    """링크 게시물의 외부 URL. 셀프포스트면 None."""
+    m = re.search(r'<a href="([^"]+)">\s*\[link\]\s*</a>', content_html)
+    if not m:
+        return None
+    url = html.unescape(m.group(1))
+    # 셀프포스트는 [link]가 자기 permalink를 가리킨다
+    return None if url.rstrip("/") == permalink.rstrip("/") else url
+
+
+@retry(times=6, base_delay=15, exceptions=(requests.RequestException,))
+def _download_rss() -> str:
+    resp = requests.get(
+        RSS_URL,
+        headers={"User-Agent": USER_AGENT, "Accept": "application/atom+xml, text/xml"},
+        timeout=25,
     )
+    # 429가 잦다. raise_for_status가 HTTPError를 던져서 위 retry가 백오프함
+    resp.raise_for_status()
+    if "<entry" not in resp.text:
+        raise ValueError("피드에 entry가 없음 (차단 페이지를 받았을 가능성)")
+    return resp.text
 
 
-@retry(times=3, base_delay=3, exceptions=(PrawcoreException,))
-def fetch_candidates(reddit, seen_ids: set, pool_size: int = FETCH_POOL_SIZE):
-    subreddit = reddit.subreddit(SUBREDDIT_NAME)
+def fetch_posts(seen_ids: set) -> list:
+    """hot 피드를 파싱해 후보 게시물 목록을 만든다 (hot 순위 포함)."""
+    feed = _download_rss()
+    entries = ET.fromstring(feed).findall("a:entry", ATOM_NS)
+    log.info(f"RSS 수신: entry {len(entries)}개")
+
     posts = []
-    for submission in subreddit.hot(limit=pool_size):
-        if submission.stickied:
+    skipped_mega = 0
+    for rank, e in enumerate(entries):
+        def txt(tag):
+            node = e.find(f"a:{tag}", ATOM_NS)
+            return (node.text or "").strip() if node is not None else ""
+
+        # RSS의 id는 't3_1vocawt' 형식. praw 시절 sent_ids와 --mark-sent가
+        # 접두사 없는 '1vocawt'를 쓰므로 벗겨서 통일한다
+        post_id = txt("id").removeprefix("t3_")
+        title = txt("title")
+        if not post_id or not title:
             continue
-        if submission.id in seen_ids:
+        if MEGATHREAD_PATTERN.match(title):
+            skipped_mega += 1
             continue
-        posts.append(submission)
+        if post_id in seen_ids:
+            continue
+
+        link_node = e.find("a:link", ATOM_NS)
+        permalink = link_node.attrib.get("href", "") if link_node is not None else ""
+        author_node = e.find("a:author/a:name", ATOM_NS)
+        content_node = e.find("a:content", ATOM_NS)
+        content_html = html.unescape(content_node.text or "") if content_node is not None else ""
+
+        published = txt("published") or txt("updated")
+        try:
+            created = datetime.fromisoformat(published)
+        except ValueError:
+            created = datetime.now(timezone.utc)
+
+        posts.append({
+            "id": post_id,
+            "title": html.unescape(title),
+            "body": _parse_body(content_html),
+            "url": _parse_external_url(content_html, permalink),
+            "permalink": permalink,
+            "author": (author_node.text or "").strip() if author_node is not None else "",
+            "created": created,
+            "hot_rank": rank + 1,
+        })
+
+    log.info(
+        f"메가스레드 제외 {skipped_mega}개 / 중복 제외 후 신규 후보 {len(posts)}개"
+    )
     return posts
 
 
-@retry(times=2, base_delay=2, exceptions=(PrawcoreException,))
-def get_top_comments(submission, n):
-    submission.comment_sort = "top"
-    submission.comments.replace_more(limit=0)
-    return [c.body for c in submission.comments[:n] if hasattr(c, "body")]
+# ── apewisdom 티커 트렌드 ────────────────────────────────
+@retry(times=3, base_delay=3, exceptions=(requests.RequestException,))
+def _download_apewisdom() -> dict:
+    resp = requests.get(APEWISDOM_URL, headers={"User-Agent": USER_AGENT}, timeout=20)
+    resp.raise_for_status()
+    results = resp.json().get("results", [])
+    if not results:
+        raise ValueError("apewisdom 응답에 results가 비어 있음")
+    return {
+        r["ticker"]: {
+            "mentions": int(r.get("mentions") or 0),
+            "upvotes": int(r.get("upvotes") or 0),
+            "rank": int(r.get("rank") or 0),
+            "rank_24h_ago": int(r["rank_24h_ago"]) if r.get("rank_24h_ago") else None,
+        }
+        for r in results
+    }
 
 
+def load_ticker_trend():
+    """{티커: 0~1 점수} 와 상위 티커 목록. 실패하면 (None, None)."""
+    try:
+        data = _download_apewisdom()
+    except Exception as e:
+        log.warning(f"apewisdom 조회 실패, 로컬 티커 카운트로 폴백해요: {e}")
+        return None, None
+
+    top = sorted(data.items(), key=lambda kv: kv[1]["mentions"], reverse=True)[:APEWISDOM_TOP_N]
+    if not top:
+        return None, None
+
+    max_mentions = max(v["mentions"] for _, v in top) or 1
+    scores = {}
+    for ticker, v in top:
+        score = v["mentions"] / max_mentions
+        prev = v["rank_24h_ago"]
+        if prev is not None and prev - v["rank"] >= MOMENTUM_RANK_JUMP:
+            score = min(1.0, score + MOMENTUM_BONUS)
+        scores[ticker] = score
+
+    log.info(
+        f"apewisdom 티커 트렌드 로드: 상위 {len(scores)}개 "
+        f"(1위 {top[0][0]} {top[0][1]['mentions']}회)"
+    )
+    return scores, [(t, v["mentions"]) for t, v in top]
+
+
+# ── 점수 계산 ────────────────────────────────────────────
 def _minmax(values):
     lo, hi = min(values), max(values)
     if hi == lo:
@@ -282,37 +440,46 @@ def _minmax(values):
     return [(v - lo) / (hi - lo) for v in values]
 
 
-def score_and_collect(posts, valid_tickers):
+def score_and_collect(posts, valid_tickers, trend_scores):
     if not posts:
         return [], Counter()
 
-    now = datetime.now(timezone.utc).timestamp()
+    now = datetime.now(timezone.utc)
 
-    engagement_raw = [p.score + p.num_comments * 2 for p in posts]
-    velocity_raw = [
-        (p.score + p.num_comments * 2) / max((now - p.created_utc) / 3600, 0.5)
-        for p in posts
-    ]
+    # hot 순위: 지수 감쇠. minmax를 쓰지 않는 이유는 위 HOT_RANK_DECAY 주석 참고
+    # (이미 0~1이고, "몇 위인가"의 절대적 의미를 보존해야 함)
+    hot_norm = [math.exp(-(p["hot_rank"] - 1) / HOT_RANK_DECAY) for p in posts]
+    # 신선도: 오래될수록 낮게
+    age_hours = [max((now - p["created"]).total_seconds() / 3600, 0.0) for p in posts]
+    fresh_norm = _minmax([-a for a in age_hours])
+
+    # apewisdom 상위권은 1~2글자 티커의 $ 생략을 허용하는 화이트리스트로도 쓴다
+    short_whitelist = set(trend_scores) if trend_scores else None
 
     ticker_counter = Counter()
     post_tickers = []
     for p in posts:
-        tickers = extract_tickers(p.title + " " + (p.selftext or ""), valid_tickers)
+        tickers = extract_tickers(
+            p["title"] + " " + p["body"], valid_tickers, short_whitelist
+        )
         post_tickers.append(tickers)
         ticker_counter.update(set(tickers))
 
-    top_trending = {t for t, _ in ticker_counter.most_common(10)}
-    engagement_norm = _minmax(engagement_raw)
-    velocity_norm = _minmax(velocity_raw)
+    # apewisdom이 죽었으면 로컬 카운트 상위 10개를 트렌딩으로 간주 (구 동작)
+    local_top = {t for t, _ in ticker_counter.most_common(10)}
 
     scored = []
     for i, p in enumerate(posts):
-        flair_bonus = 1.0 if p.link_flair_text in PRIORITY_FLAIRS else 0.0
-        ticker_bonus = 1.0 if set(post_tickers[i]) & top_trending else 0.0
+        if trend_scores:
+            ticker_bonus = max(
+                (trend_scores.get(t, 0.0) for t in post_tickers[i]), default=0.0
+            )
+        else:
+            ticker_bonus = 1.0 if set(post_tickers[i]) & local_top else 0.0
+
         final_score = (
-            engagement_norm[i] * WEIGHTS["engagement"]
-            + velocity_norm[i] * WEIGHTS["velocity"]
-            + flair_bonus * WEIGHTS["flair"]
+            hot_norm[i] * WEIGHTS["hot_rank"]
+            + fresh_norm[i] * WEIGHTS["freshness"]
             + ticker_bonus * WEIGHTS["ticker_trend"]
         )
         scored.append((final_score, p, post_tickers[i]))
@@ -321,34 +488,25 @@ def score_and_collect(posts, valid_tickers):
     return scored[:TOP_N_CANDIDATES], ticker_counter
 
 
-def build_output(scored, ticker_counter):
+def build_output(scored, ticker_counter, trending):
     items = []
     for final_score, p, tickers in scored:
-        try:
-            top_comments = get_top_comments(p, TOP_COMMENTS_PER_POST)
-        except PrawcoreException as e:
-            log.warning(f"댓글 수집 실패, 이 게시물은 빈 댓글로 대체해요 (id={p.id}): {e}")
-            top_comments = []
-
         items.append({
-            "id": p.id,
-            "title": p.title,
-            "body": p.selftext if p.is_self else "",
-            "url": p.url if not p.is_self else None,
-            "permalink": f"https://reddit.com{p.permalink}",
-            "created_kst": datetime.fromtimestamp(p.created_utc, tz=timezone.utc)
-                .astimezone(KST).strftime("%Y-%m-%d %H:%M KST"),
-            "num_comments": p.num_comments,
-            "score": p.score,
-            "upvote_ratio": p.upvote_ratio,
-            "flair": p.link_flair_text,
+            "id": p["id"],
+            "title": p["title"],
+            "body": p["body"],
+            "url": p["url"],
+            "permalink": p["permalink"],
+            "author": p["author"],
+            "created_kst": p["created"].astimezone(KST).strftime("%Y-%m-%d %H:%M KST"),
+            "hot_rank": p["hot_rank"],
             "tickers": sorted(set(tickers)),
-            "top_comments": top_comments,
             "final_score": round(final_score, 4),
         })
     return {
         "generated_at_kst": datetime.now(KST).strftime("%Y-%m-%d %H:%M KST"),
-        "trending_tickers": ticker_counter.most_common(5),
+        "trending_tickers": trending if trending else ticker_counter.most_common(5),
+        "trending_source": "apewisdom" if trending else "local",
         "candidates": items,
     }
 
@@ -383,17 +541,13 @@ def run_pipeline():
     seen_ids = load_sent_ids()
     log.info(f"최근 {SENT_ID_RETENTION_DAYS}일 내 중복 제외 대상: {len(seen_ids)}개")
 
-    reddit = get_reddit()
-    posts = fetch_candidates(reddit, seen_ids)
-    if len(posts) < TOP_N_CANDIDATES:
-        log.warning(
-            f"중복 제외 후 후보가 {len(posts)}개뿐이라 더 넓은 풀로 재시도해요"
-        )
-        posts = fetch_candidates(reddit, seen_ids, pool_size=FETCH_POOL_SIZE * 2)
-    log.info(f"수집된 신규 후보(중복 제외): {len(posts)}개")
+    posts = fetch_posts(seen_ids)
+    if not posts:
+        raise RuntimeError("후보 게시물이 하나도 없어요 (피드가 비었거나 전부 중복)")
 
-    scored, ticker_counter = score_and_collect(posts, valid_tickers)
-    output = build_output(scored, ticker_counter)
+    trend_scores, trending = load_ticker_trend()
+    scored, ticker_counter = score_and_collect(posts, valid_tickers, trend_scores)
+    output = build_output(scored, ticker_counter, trending)
 
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)

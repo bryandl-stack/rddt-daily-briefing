@@ -10,19 +10,33 @@
 
 2. Python 패키지 설치:
    ```bash
-   pip install praw requests
+   pip install requests
    ```
 
 3. 환경변수 설정 (`~/.wsb_env` 같은 별도 파일로 분리 권장):
    ```bash
-   export REDDIT_CLIENT_ID="..."
-   export REDDIT_CLIENT_SECRET="..."
-   export REDDIT_USERNAME="..."         # User-Agent에 포함됨. Reddit API 정책상
-                                         # 실제 계정명이 없으면 rate-limit/차단 위험이 있음
    export TELEGRAM_BOT_TOKEN="..."      # @BotFather 로 발급
    export TELEGRAM_CHAT_ID="..."        # 봇과 대화 후 getUpdates로 확인
    export NOTIFY_CHANNEL="telegram"     # telegram / slack / file
    ```
+
+   **Reddit 자격증명은 필요 없어요.** 수집은 Reddit 공식 Atom 피드
+   (`/r/wallstreetbets/hot/.rss`)와 apewisdom 티커 집계 API를 쓰는데
+   둘 다 인증이 없어요.
+
+## 데이터 소스와 한계
+
+| 항목 | 출처 |
+|---|---|
+| 게시물 (제목·본문·작성자·시각·permalink) | Reddit Atom 피드, 1회 요청 |
+| hot 순위 | 피드에서의 위치 |
+| 티커 트렌드 | apewisdom.io (서브레딧 전체 집계 + 24h 순위 변동) |
+
+Atom 피드에는 **투표수·댓글수·플레어·댓글 본문이 없어요.** hot 피드의
+순서가 Reddit의 랭킹(투표수+참여속도 반영)이라 이걸 인기 지표로 대신 써요.
+
+피드는 rate limit이 빡빡해서(60초를 띄워도 429가 날 수 있음) 요청을
+하루 1회로 제한하고, 429가 나면 지수 백오프로 최대 6회 재시도해요.
 
 ## 스킬 테스트 (수동 실행)
 
